@@ -202,7 +202,7 @@ Resources:
                 environment:
                   POSTGRES_DB: socket-gitlab
                   POSTGRES_USER: socket
-                  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+                  POSTGRES_PASSWORD: ${!POSTGRES_PASSWORD}
                 healthcheck:
                   test: ["CMD-SHELL", "pg_isready -U socket -d socket-gitlab"]
                   interval: 5s
