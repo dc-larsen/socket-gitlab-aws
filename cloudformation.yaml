@@ -1,0 +1,244 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Socket GitLab Integration - Single EC2 with Docker Compose
+
+Parameters:
+  SocketOrg:
+    Type: String
+    Description: Socket organization slug
+
+  SocketApiKey:
+    Type: String
+    NoEcho: true
+    Description: Socket API token
+
+  GitlabToken:
+    Type: String
+    NoEcho: true
+    Description: GitLab access token (api + read_repository scopes)
+
+  GitlabGroupId:
+    Type: String
+    Description: GitLab group ID to scan
+
+  GitlabInstance:
+    Type: String
+    Default: https://gitlab.com
+    Description: GitLab instance URL (change for self-hosted)
+
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 key pair for SSH access
+
+  InstanceType:
+    Type: String
+    Default: t3.small
+    AllowedValues:
+      - t3.micro
+      - t3.small
+      - t3.medium
+
+  SSHCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR range allowed to SSH (restrict to your IP)
+
+  WebhookCidrIp:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: CIDR range allowed to reach webhook port (restrict to GitLab IPs)
+
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64
+
+Resources:
+
+  # --- Networking ---
+
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/24
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: socket-gitlab
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  GatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: 10.0.0.0/24
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: socket-gitlab-public
+
+  RouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+
+  DefaultRoute:
+    Type: AWS::EC2::Route
+    DependsOn: GatewayAttachment
+    Properties:
+      RouteTableId: !Ref RouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  SubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref RouteTable
+
+  # --- Security ---
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Socket GitLab integration
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5050
+          ToPort: 5050
+          CidrIp: !Ref WebhookCidrIp
+          Description: GitLab webhook delivery
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref SSHCidrIp
+          Description: SSH access
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Outbound to GitLab and Socket API
+
+  # --- Compute ---
+
+  ElasticIP:
+    Type: AWS::EC2::EIP
+
+  EIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref Instance
+      AllocationId: !GetAtt ElasticIP.AllocationId
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      ImageId: !Ref LatestAmiId
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: 20
+            VolumeType: gp3
+      Tags:
+        - Key: Name
+          Value: socket-gitlab
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash
+            set -euo pipefail
+
+            # Install Docker
+            dnf update -y
+            dnf install -y docker
+            systemctl enable docker
+            systemctl start docker
+
+            # Install Docker Compose plugin
+            mkdir -p /usr/local/lib/docker/cli-plugins
+            curl -SL https://github.com/docker/compose/releases/latest/download/docker-compose-linux-x86_64 \
+              -o /usr/local/lib/docker/cli-plugins/docker-compose
+            chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+
+            # Generate Postgres password
+            DB_PASS=$(openssl rand -hex 16)
+
+            mkdir -p /opt/socket-gitlab
+            cd /opt/socket-gitlab
+
+            # Write environment file
+            cat > .env <<EOF
+            POSTGRES_PASSWORD=$DB_PASS
+            DATABASE_URL=postgres://socket:$DB_PASS@db/socket-gitlab
+            SOCKET_ORG=${SocketOrg}
+            SOCKET_API_KEY=${SocketApiKey}
+            GITLAB_TOKEN=${GitlabToken}
+            GITLAB_GROUP_ID=${GitlabGroupId}
+            GITLAB_INSTANCE=${GitlabInstance}
+            EXTERNAL_WEBHOOK_URL=http://${ElasticIP}:5050/webhook/gitlab
+            SERVICE_ENV=prod
+            EOF
+
+            # Write docker-compose.yml
+            cat > docker-compose.yml <<'COMPOSE'
+            services:
+              db:
+                image: postgres:17-alpine
+                restart: unless-stopped
+                volumes:
+                  - pgdata:/var/lib/postgresql/data
+                environment:
+                  POSTGRES_DB: socket-gitlab
+                  POSTGRES_USER: socket
+                  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U socket -d socket-gitlab"]
+                  interval: 5s
+                  timeout: 3s
+                  retries: 5
+
+              app:
+                image: socketdev/socket-gitlab:latest
+                restart: unless-stopped
+                ports:
+                  - "5050:5050"
+                depends_on:
+                  db:
+                    condition: service_healthy
+                env_file: .env
+
+            volumes:
+              pgdata:
+            COMPOSE
+
+            # Start services
+            docker compose up -d
+
+Outputs:
+  PublicIP:
+    Description: Elastic IP of the instance
+    Value: !Ref ElasticIP
+
+  WebhookURL:
+    Description: URL to configure in GitLab webhook settings
+    Value: !Sub http://${ElasticIP}:5050/webhook/gitlab
+
+  HealthCheckURL:
+    Description: Health check endpoint
+    Value: !Sub http://${ElasticIP}:5050/health
+
+  SSHCommand:
+    Description: SSH into the instance
+    Value: !Sub ssh ec2-user@${ElasticIP}
