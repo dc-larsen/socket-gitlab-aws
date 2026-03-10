@@ -210,7 +210,7 @@ Resources:
                   retries: 5
 
               app:
-                image: socketdev/socket-gitlab:latest
+                image: socketdev/gitlab:latest
                 restart: unless-stopped
                 ports:
                   - "5050:5050"
