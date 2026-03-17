@@ -6,15 +6,13 @@ Parameters:
     Type: String
     Description: Socket organization slug
 
-  SocketApiKey:
+  SocketApiKeySecretArn:
     Type: String
-    NoEcho: true
-    Description: Socket API token
+    Description: ARN of the Secrets Manager secret containing the Socket API key
 
-  GitlabToken:
+  GitlabTokenSecretArn:
     Type: String
-    NoEcho: true
-    Description: GitLab access token (api + read_repository scopes)
+    Description: ARN of the Secrets Manager secret containing the GitLab access token
 
   GitlabGroupId:
     Type: String
@@ -46,6 +44,22 @@ Parameters:
     Type: String
     Default: 0.0.0.0/0
     Description: CIDR range allowed to reach webhook port (restrict to GitLab IPs)
+
+  EnableDependencyOverviewComments:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Post dependency overview comments on GitLab merge requests
+
+  EnableAlertsComments:
+    Type: String
+    Default: 'true'
+    AllowedValues:
+      - 'true'
+      - 'false'
+    Description: Post security alert comments on GitLab merge requests
 
   LatestAmiId:
     Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
@@ -126,6 +140,36 @@ Resources:
           CidrIp: 0.0.0.0/0
           Description: Outbound to GitLab and Socket API
 
+  # --- IAM ---
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: SecretsManagerReadOnly
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource:
+                  - !Ref SocketApiKeySecretArn
+                  - !Ref GitlabTokenSecretArn
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
   # --- Compute ---
 
   ElasticIP:
@@ -141,6 +185,7 @@ Resources:
     Type: AWS::EC2::Instance
     Properties:
       InstanceType: !Ref InstanceType
+      IamInstanceProfile: !Ref InstanceProfile
       KeyName: !Ref KeyPairName
       SubnetId: !Ref PublicSubnet
       SecurityGroupIds:
@@ -172,6 +217,17 @@ Resources:
               -o /usr/local/lib/docker/cli-plugins/docker-compose
             chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
 
+            # Fetch secrets from AWS Secrets Manager
+            REGION=$(ec2-metadata --availability-zone | awk '{print $2}' | sed 's/.$//')
+            SOCKET_API_KEY=$(aws secretsmanager get-secret-value \
+              --region $REGION \
+              --secret-id ${SocketApiKeySecretArn} \
+              --query SecretString --output text)
+            GITLAB_TOKEN=$(aws secretsmanager get-secret-value \
+              --region $REGION \
+              --secret-id ${GitlabTokenSecretArn} \
+              --query SecretString --output text)
+
             # Generate Postgres password
             DB_PASS=$(openssl rand -hex 16)
 
@@ -183,13 +239,18 @@ Resources:
             POSTGRES_PASSWORD=$DB_PASS
             DATABASE_URL=postgres://socket:$DB_PASS@db/socket-gitlab
             SOCKET_ORG=${SocketOrg}
-            SOCKET_API_KEY=${SocketApiKey}
-            GITLAB_TOKEN=${GitlabToken}
+            SOCKET_API_KEY=$SOCKET_API_KEY
+            GITLAB_TOKEN=$GITLAB_TOKEN
             GITLAB_GROUP_ID=${GitlabGroupId}
             GITLAB_INSTANCE=${GitlabInstance}
             EXTERNAL_WEBHOOK_URL=http://${ElasticIP}:5050/webhook/gitlab
             SERVICE_ENV=prod
+            ENABLE_DEPENDENCY_OVERVIEW_COMMENTS=${EnableDependencyOverviewComments}
+            ENABLE_ALERTS_COMMENTS=${EnableAlertsComments}
             EOF
+
+            # Restrict .env file permissions
+            chmod 600 .env
 
             # Write docker-compose.yml
             cat > docker-compose.yml <<'COMPOSE'
